@@ -61,7 +61,11 @@ pub struct Job {
     pub accepted_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub deliverable_hash: Option<BytesN<32>>,
+    /// #140: Off-chain pointer for deliverable content (bounded length).
+    pub deliverable_uri: Option<String>,
     pub dispute_raised: bool,
+    /// #138: Number of client revision rounds on this job.
+    pub revision_count: u32,
 }
 
 #[contracttype]
@@ -257,6 +261,10 @@ pub struct Config {
     /// lets operators seed a starting reputation without blocking cold-start
     /// agents.
     pub starting_reputation: u32,
+    /// #138: Maximum client revision requests per job.
+    pub max_revisions: u32,
+    /// #139: Days after deliverable submission before permissionless release.
+    pub auto_release_days: u64,
 }
 
 #[contracttype]
@@ -393,6 +401,10 @@ pub enum Error {
     /// #111: Returned by `resolve_dispute` when a split percentage is greater
     /// than 100.
     InvalidSplit = 57,
+    TooManyBids = 58,
+    AgentNotPayable = 59,
+    RevisionCapReached = 60,
+    AutoReleaseNotDue = 61,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -427,6 +439,12 @@ pub const DEFAULT_RESOLUTION_DEADLINE_DAYS: u64 = 14;
 /// #115: Default percentage of the post-fee payout sent to the agent when the
 /// resolver times out (remainder refunded to the client).
 pub const DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT: u32 = 50;
+pub const USDC_DECIMALS: u32 = 7;
+pub const DEFAULT_MAX_BIDS_PER_JOB: u32 = 50;
+/// #140: Max bytes for on-chain deliverable URI.
+pub const MAX_DELIVERABLE_URI_LEN: u32 = 256;
+pub const DEFAULT_MAX_REVISIONS: u32 = 3;
+pub const DEFAULT_AUTO_RELEASE_DAYS: u64 = 14;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -504,6 +522,8 @@ impl AiAgentMarketplace {
             total_locked_escrow: 0,
             max_bids_per_job: DEFAULT_MAX_BIDS_PER_JOB,
             starting_reputation: 0,
+            max_revisions: DEFAULT_MAX_REVISIONS,
+            auto_release_days: DEFAULT_AUTO_RELEASE_DAYS,
         };
 
         // #103 / #104: validate every field before persisting.
@@ -978,7 +998,9 @@ impl AiAgentMarketplace {
             accepted_at: None,
             completed_at: None,
             deliverable_hash: None,
+            deliverable_uri: None,
             dispute_raised: false,
+            revision_count: 0,
         };
 
         env.storage().instance().set(&DataKey::Job(job_id), &job);
@@ -1368,6 +1390,7 @@ impl AiAgentMarketplace {
         agent: Address,
         job_id: u64,
         deliverable_hash: BytesN<32>,
+        deliverable_uri: String,
     ) -> Result<(), Error> {
         agent.require_auth();
         Self::ensure_not_paused(&env)?;
@@ -1383,14 +1406,58 @@ impl AiAgentMarketplace {
             return Err(Error::JobNotInProgress);
         }
 
+        if deliverable_uri.len() as u32 > MAX_DELIVERABLE_URI_LEN {
+            return Err(Error::InputTooLong);
+        }
+
         job.deliverable_hash = Some(deliverable_hash);
+        job.deliverable_uri = Some(deliverable_uri.clone());
         job.status = JobStatus::Completed;
         job.completed_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
         env.events().publish(
             (symbol_short!("deliver"), job_id, agent.clone()),
-            (job_id, agent, deliverable_hash),
+            (job_id, agent, deliverable_hash, deliverable_uri),
+        );
+
+        Ok(())
+    }
+
+    /// #138: Client requests revisions before approve/dispute.
+    pub fn request_changes(
+        env: Env,
+        client: Address,
+        job_id: u64,
+        notes_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        client.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        let mut job = Self::get_job(&env, job_id)?;
+
+        if job.client != client {
+            return Err(Error::Unauthorized);
+        }
+        if job.status != JobStatus::Completed {
+            return Err(Error::JobNotCompleted);
+        }
+        if job.revision_count >= config.max_revisions {
+            return Err(Error::RevisionCapReached);
+        }
+
+        job.revision_count += 1;
+        job.status = JobStatus::InProgress;
+        job.completed_at = None;
+        job.deliverable_hash = None;
+        job.deliverable_uri = None;
+        env.storage().instance().set(&DataKey::Job(job_id), &job);
+
+        env.events().publish(
+            (symbol_short!("rev_req"), job_id, client.clone()),
+            (job_id, client, notes_hash, job.revision_count),
         );
 
         Ok(())
@@ -1467,6 +1534,60 @@ impl AiAgentMarketplace {
         );
 
         Ok(())
+    }
+
+    /// #141: Approve deliverable and transfer an optional tip (no extra platform fee).
+    pub fn approve_deliverable_with_tip(
+        env: Env,
+        client: Address,
+        job_id: u64,
+        tip: i128,
+    ) -> Result<(), Error> {
+        client.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        if tip < 0 {
+            return Err(Error::InvalidBudget);
+        }
+
+        // Perform the standard approval payout first.
+        {
+            let env2 = env.clone();
+            Self::approve_deliverable(env2, client.clone(), job_id)?;
+        }
+
+        if tip > 0 {
+            let config = Self::get_config(&env)?;
+            let job = Self::get_job(&env, job_id)?;
+            let agent = job.assigned_agent.ok_or(Error::Unauthorized)?;
+            let usdc = TokenClient::new(&env, &config.usdc_token);
+            usdc.transfer(&client, &agent, &tip);
+            env.events().publish(
+                (symbol_short!("tip_paid"), job_id, client.clone()),
+                (job_id, agent, tip),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// #139: Permissionless escrow release when the client never reviewed in time.
+    pub fn release_if_unreviewed(env: Env, job_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        let config = Self::get_config(&env)?;
+        let job = Self::get_job(&env, job_id)?;
+
+        if job.status != JobStatus::Completed {
+            return Err(Error::JobNotCompleted);
+        }
+        let completed_at = job.completed_at.ok_or(Error::JobNotCompleted)?;
+        let release_at = completed_at + config.auto_release_days * 86_400;
+        if env.ledger().timestamp() < release_at {
+            return Err(Error::AutoReleaseNotDue);
+        }
+
+        // Re-use the client approval path (same fee treatment as manual approve).
+        Self::approve_deliverable(env, job.client.clone(), job_id)
     }
 
     /// Raise a dispute
