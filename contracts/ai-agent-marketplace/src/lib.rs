@@ -3173,7 +3173,13 @@ mod budget_test;
 mod test_support;
 
 #[cfg(test)]
-mod negative_initialize_test;
+mod negative_update_agent_test;
 
 #[cfg(test)]
-mod negative_register_agent_test;
+mod negative_verify_skill_test;
+
+#[cfg(test)]
+mod negative_post_job_test;
+
+#[cfg(test)]
+mod negative_cancel_job_test;
