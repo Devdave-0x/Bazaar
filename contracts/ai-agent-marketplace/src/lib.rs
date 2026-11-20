@@ -257,6 +257,8 @@ pub struct Config {
     /// lets operators seed a starting reputation without blocking cold-start
     /// agents.
     pub starting_reputation: u32,
+    /// #142: Maximum concurrent in-progress jobs per agent (0 = unlimited).
+    pub max_active_jobs_per_agent: u32,
 }
 
 #[contracttype]
@@ -299,6 +301,8 @@ pub enum DataKey {
     Resolvers,
     /// #116: Monotonic counter used to round-robin disputes across resolvers.
     ResolverCounter,
+    /// #142: Active (in-progress) job count per agent owner.
+    ActiveJobs(Address),
 }
 
 #[contracttype]
@@ -393,6 +397,9 @@ pub enum Error {
     /// #111: Returned by `resolve_dispute` when a split percentage is greater
     /// than 100.
     InvalidSplit = 57,
+    TooManyBids = 58,
+    AgentNotPayable = 59,
+    MaxActiveJobsReached = 60,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -427,6 +434,9 @@ pub const DEFAULT_RESOLUTION_DEADLINE_DAYS: u64 = 14;
 /// #115: Default percentage of the post-fee payout sent to the agent when the
 /// resolver times out (remainder refunded to the client).
 pub const DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT: u32 = 50;
+pub const USDC_DECIMALS: u32 = 7;
+pub const DEFAULT_MAX_BIDS_PER_JOB: u32 = 50;
+pub const DEFAULT_MAX_ACTIVE_JOBS_PER_AGENT: u32 = 0;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -504,6 +514,7 @@ impl AiAgentMarketplace {
             total_locked_escrow: 0,
             max_bids_per_job: DEFAULT_MAX_BIDS_PER_JOB,
             starting_reputation: 0,
+            max_active_jobs_per_agent: DEFAULT_MAX_ACTIVE_JOBS_PER_AGENT,
         };
 
         // #103 / #104: validate every field before persisting.
@@ -1262,6 +1273,16 @@ impl AiAgentMarketplace {
             return Err(Error::BidNotFound);
         }
 
+        // #142: Cap concurrent active jobs per agent.
+        if config.max_active_jobs_per_agent > 0 {
+            let active: u32 = env.storage().instance()
+                .get(&DataKey::ActiveJobs(bid.agent.clone()))
+                .unwrap_or(0);
+            if active >= config.max_active_jobs_per_agent {
+                return Err(Error::MaxActiveJobsReached);
+            }
+        }
+
         // Calculate platform fee
         let platform_fee = (bid.amount * config.platform_fee_bps as i128) / 10000;
         let escrow_amount = bid.amount + platform_fee;
@@ -1331,6 +1352,8 @@ impl AiAgentMarketplace {
             .unwrap_or(Vec::new(&env));
         agent_jobs.push_back(job_id);
         env.storage().instance().set(&DataKey::JobsByAgent(bid.agent.clone()), &agent_jobs);
+
+        Self::incr_active_jobs(&env, &bid.agent);
 
         // Update stats
         let mut stats = Self::get_platform_stats(&env)?;
@@ -2915,6 +2938,23 @@ impl AiAgentMarketplace {
     /// updates the platform's average completion time, and releases the
     /// locked-escrow accounting.  Callers must have already updated the escrow
     /// record before invoking this.
+    fn incr_active_jobs(env: &Env, agent: &Address) {
+        let count: u32 = env.storage().instance()
+            .get(&DataKey::ActiveJobs(agent.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(&DataKey::ActiveJobs(agent.clone()), &(count + 1));
+    }
+
+    fn decr_active_jobs(env: &Env, agent: &Address) {
+        let count: u32 = env.storage().instance()
+            .get(&DataKey::ActiveJobs(agent.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::ActiveJobs(agent.clone()),
+            &count.saturating_sub(1),
+        );
+    }
+
     fn finalize_job_payout(
         env: &Env,
         job_id: u64,
@@ -2923,6 +2963,8 @@ impl AiAgentMarketplace {
         agent_amount: i128,
     ) -> Result<(), Error> {
         let now = env.ledger().timestamp();
+
+        Self::decr_active_jobs(env, agent_owner);
 
         // Update agent stats.
         let agent_id: u64 = env.storage().instance()
