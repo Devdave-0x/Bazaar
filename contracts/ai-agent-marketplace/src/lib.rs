@@ -62,6 +62,10 @@ pub struct Job {
     pub completed_at: Option<u64>,
     pub deliverable_hash: Option<BytesN<32>>,
     pub dispute_raised: bool,
+    /// #137: Minimum agent reputation required to bid on this job (0 = use global default only).
+    pub min_reputation: u32,
+    /// #136: When non-empty, only listed agent owners may place bids.
+    pub invited_agents: Vec<Address>,
 }
 
 #[contracttype]
@@ -393,6 +397,12 @@ pub enum Error {
     /// #111: Returned by `resolve_dispute` when a split percentage is greater
     /// than 100.
     InvalidSplit = 57,
+    TooManyBids = 58,
+    AgentNotPayable = 59,
+    /// #136: Bidder is not on the job's invite list.
+    AgentNotInvited = 60,
+    /// #135: Bid was explicitly rejected and cannot be accepted.
+    BidRejected = 61,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -427,6 +437,8 @@ pub const DEFAULT_RESOLUTION_DEADLINE_DAYS: u64 = 14;
 /// #115: Default percentage of the post-fee payout sent to the agent when the
 /// resolver times out (remainder refunded to the client).
 pub const DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT: u32 = 50;
+pub const USDC_DECIMALS: u32 = 7;
+pub const DEFAULT_MAX_BIDS_PER_JOB: u32 = 50;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -935,6 +947,8 @@ impl AiAgentMarketplace {
         required_skills: Vec<String>,
         budget: i128,
         deadline_days: u64,
+        invited_agents: Vec<Address>,
+        min_reputation: u32,
     ) -> Result<u64, Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
@@ -959,6 +973,10 @@ impl AiAgentMarketplace {
             return Err(Error::InvalidDeadline);
         }
 
+        if min_reputation > 100 {
+            return Err(Error::InvalidConfig);
+        }
+
         let job_id = Self::next_job_id(&env)?;
         let now = env.ledger().timestamp();
         let deadline = now + (deadline_days * 86400); // Convert days to seconds
@@ -979,6 +997,8 @@ impl AiAgentMarketplace {
             completed_at: None,
             deliverable_hash: None,
             dispute_raised: false,
+            min_reputation,
+            invited_agents: invited_agents.clone(),
         };
 
         env.storage().instance().set(&DataKey::Job(job_id), &job);
@@ -1091,6 +1111,16 @@ impl AiAgentMarketplace {
             return Err(Error::AgentInactive);
         }
 
+        // #136: invite-only jobs reject non-invited agents.
+        if !job.invited_agents.is_empty() && !job.invited_agents.contains(agent_owner.clone()) {
+            return Err(Error::AgentNotInvited);
+        }
+
+        // #137: per-job reputation floor (stricter than the global gate).
+        if agent.reputation < job.min_reputation {
+            return Err(Error::AgentReputationTooLow);
+        }
+
         // #119: cold-start exemption.  Agents that have never completed a job
         // are exempt from the minimum-reputation gate so they can earn their
         // first review.  Once they complete a job, the gate applies normally.
@@ -1177,6 +1207,97 @@ impl AiAgentMarketplace {
         Ok(bid_id)
     }
 
+    /// #134: Update a pending bid without withdrawing and re-bidding.
+    pub fn update_bid(
+        env: Env,
+        agent_owner: Address,
+        bid_id: u64,
+        amount: i128,
+        proposed_timeline_days: u64,
+        proposal: String,
+    ) -> Result<(), Error> {
+        agent_owner.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::ensure_not_denylisted(&env, &agent_owner)?;
+
+        let mut bid = Self::get_bid(&env, bid_id)?;
+        if bid.agent != agent_owner {
+            return Err(Error::Unauthorized);
+        }
+        if bid.status != BidStatus::Pending {
+            return Err(Error::BidNotPending);
+        }
+
+        // Resolve the job via the bid index (first matching job in storage).
+        let job_id = Self::job_id_for_bid(&env, bid_id)?;
+        let job = Self::get_job(&env, job_id)?;
+
+        if job.status != JobStatus::Open {
+            return Err(Error::JobNotOpen);
+        }
+        if env.ledger().timestamp() > job.deadline {
+            return Err(Error::JobExpired);
+        }
+        if amount < job.budget / 2 {
+            return Err(Error::BidTooLow);
+        }
+        if amount > job.budget {
+            return Err(Error::InsufficientBidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        bid.amount = amount;
+        bid.proposed_timeline = now + (proposed_timeline_days * 86400);
+        bid.proposal = proposal;
+        bid.submitted_at = now;
+        env.storage().instance().set(&DataKey::Bid(bid_id), &bid);
+
+        env.events().publish(
+            (symbol_short!("bid_update"), job_id, agent_owner.clone()),
+            (bid_id, job_id, agent_owner, amount),
+        );
+
+        Ok(())
+    }
+
+    /// #135: Client explicitly rejects a pending bid.
+    pub fn reject_bid(
+        env: Env,
+        client: Address,
+        job_id: u64,
+        bid_id: u64,
+    ) -> Result<(), Error> {
+        client.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let job = Self::get_job(&env, job_id)?;
+        if job.client != client {
+            return Err(Error::Unauthorized);
+        }
+
+        let job_bids: Vec<u64> = env.storage().instance()
+            .get(&DataKey::BidsByJob(job_id))
+            .unwrap_or(Vec::new(&env));
+        if !job_bids.contains(&bid_id) {
+            return Err(Error::BidNotFound);
+        }
+
+        let mut bid = Self::get_bid(&env, bid_id)?;
+        if bid.status != BidStatus::Pending {
+            return Err(Error::BidNotPending);
+        }
+
+        bid.status = BidStatus::Rejected;
+        env.storage().instance().set(&DataKey::Bid(bid_id), &bid);
+
+        env.events().publish(
+            (symbol_short!("bid_reject"), job_id, client.clone()),
+            (bid_id, job_id, client),
+        );
+
+        Ok(())
+    }
+
     /// Withdraw a pending bid (agent only)
     pub fn withdraw_bid(
         env: Env,
@@ -1245,6 +1366,9 @@ impl AiAgentMarketplace {
         let mut bid = Self::get_bid(&env, bid_id)?;
 
         if bid.status != BidStatus::Pending {
+            if bid.status == BidStatus::Rejected {
+                return Err(Error::BidRejected);
+            }
             return Err(Error::BidNotPending);
         }
 
@@ -2793,6 +2917,20 @@ impl AiAgentMarketplace {
     /// - Returns an empty Vec when `offset >= all.len()` or `limit == 0`.
     /// - Clamps the end index to the actual length so callers never need to
     ///   worry about out-of-bounds accesses.
+    /// Returns the job id that owns `bid_id` by scanning the on-chain index.
+    fn job_id_for_bid(env: &Env, bid_id: u64) -> Result<u64, Error> {
+        let job_counter: u64 = env.storage().instance().get(&DataKey::JobCounter).unwrap_or(0);
+        for job_id in 1..=job_counter {
+            let bids: Vec<u64> = env.storage().instance()
+                .get(&DataKey::BidsByJob(job_id))
+                .unwrap_or(Vec::new(env));
+            if bids.contains(&bid_id) {
+                return Ok(job_id);
+            }
+        }
+        Err(Error::BidNotFound)
+    }
+
     fn paginate(env: &Env, all: &Vec<u64>, offset: u64, limit: u64) -> Vec<u64> {
         let total = all.len() as u64;
         if limit == 0 || offset >= total {
